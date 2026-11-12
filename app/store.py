@@ -1,15 +1,17 @@
 """Parquet 物理存储与统一结构读取（PyArrow）。
 
 - 每批一个独立 Parquet 文件，文件名 = 批次 UUID，既有文件永不重写；
-- 写入先落临时文件 + fsync，再原子 rename，目录（SQLite）只引用完整文件；
+- 写入先落临时文件 + fsync + footer/行数校验，再原子 rename，目录（SQLite）只引用完整文件；
 - 统一读取：按目录快照中的逻辑结构投影每个批次文件——缺列补 NULL，
   逻辑类型为 text 而文件列为 uint64 时按十进制转成文本。
 """
+import csv
+import datetime
+import io
 import os
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
 
 DATE_COLUMN = "obs_date"  # 首列观测日归一化为固定列名
@@ -37,7 +39,11 @@ def _fsync_dir(dirpath):
 
 
 def write_parquet_atomic(table, final_path):
-    """写临时文件 -> fsync -> 原子 rename -> 目录 fsync。失败清理临时文件。"""
+    """写临时文件 -> fsync -> 校验 footer -> 原子 rename -> 目录 fsync。
+
+    只有能被完整解析、且行数与内存表一致的临时文件才会 rename 成正式文件；
+    写入失败/截断失败一律清理临时文件并抛错，调用方不会登记残件。
+    """
     dirpath = os.path.dirname(final_path)
     base = os.path.basename(final_path)
     tmp_path = os.path.join(dirpath, f".{base}.tmp")
@@ -46,6 +52,10 @@ def write_parquet_atomic(table, final_path):
             pq.write_table(table, f)
             f.flush()
             os.fsync(f.fileno())
+        with open(tmp_path, "rb") as f:
+            md = pq.read_metadata(f)  # 解析 footer：截断/损坏在此暴露
+            if md.num_rows != table.num_rows:
+                raise OSError(f"Parquet 行数校验失败: {md.num_rows} != {table.num_rows}")
         os.replace(tmp_path, final_path)  # 同目录原子改名；文件名为批次UUID，不会覆盖既有文件
         _fsync_dir(dirpath)
     except BaseException:
@@ -89,6 +99,19 @@ def load_unified(parquet_dir, columns, batches):
 
 
 def table_to_csv_bytes(table):
-    sink = pa.BufferOutputStream()
-    pcsv.write_csv(table, sink)
-    return sink.getvalue().to_pybytes()
+    """统一结构导出 CSV（Python csv，按需加引号，文本中的逗号可安全往返）。"""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(table.schema.names)
+    for row in table.to_pylist():
+        out = []
+        for name in table.schema.names:
+            v = row[name]
+            if v is None:
+                out.append("")
+            elif isinstance(v, datetime.date):
+                out.append(v.isoformat())
+            else:
+                out.append(str(v))
+        writer.writerow(out)
+    return buf.getvalue().encode("utf-8")
